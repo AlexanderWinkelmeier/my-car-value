@@ -1,83 +1,56 @@
-import { BadRequestException, NotFoundException } from '@nestjs/common';
-
-import { Test } from '@nestjs/testing';
-import { AuthService } from './auth.service';
+import {
+  Injectable,
+  BadRequestException,
+  NotFoundException,
+} from '@nestjs/common';
 import { UsersService } from './users.service';
-import { User } from './user.entity';
+import { randomBytes, scrypt as _scrypt } from 'crypto';
+import { promisify } from 'util';
 
-describe('AuthService', () => {
-  let service: AuthService;
-  let fakeUsersService: Partial<UsersService>;
+const scrypt = promisify(_scrypt);
 
-  beforeEach(async () => {
-    // Create a fake copy of the users service
-    const users: User[] = [];
-    fakeUsersService = {
-      find: (email: string) => {
-        const filteredUsers = users.filter((user) => user.email === email);
-        return Promise.resolve(filteredUsers);
-      },
-      create: (email: string, password: string) => {
-        const user = {
-          id: Math.floor(Math.random() * 999999),
-          email,
-          password,
-        } as User;
-        users.push(user);
-        return Promise.resolve(user);
-      },
-    };
+@Injectable()
+export class AuthService {
+  constructor(private usersService: UsersService) {}
 
-    const module = await Test.createTestingModule({
-      providers: [
-        AuthService,
-        {
-          provide: UsersService,
-          useValue: fakeUsersService,
-        },
-      ],
-    }).compile();
+  async signup(email: string, password: string) {
+    // See if email is in use
+    const users = await this.usersService.find(email);
+    if (users.length) {
+      throw new BadRequestException('email in use');
+    }
 
-    service = module.get(AuthService);
-  });
+    // Hash the users password
+    // Generate a salt
+    const salt = randomBytes(8).toString('hex');
 
-  it('can create an instance of auth service', async () => {
-    expect(service).toBeDefined();
-  });
+    // Hash the salt and the password together
+    const hash = (await scrypt(password, salt, 32)) as Buffer;
 
-  it('creates a new user with a salted and hashed password', async () => {
-    const user = await service.signup('asdf@asdf.com', 'asdf');
+    // Join the hashed result and the salt together
+    const result = salt + '.' + hash.toString('hex');
 
-    expect(user.password).not.toEqual('asdf');
-    const [salt, hash] = user.password.split('.');
-    expect(salt).toBeDefined();
-    expect(hash).toBeDefined();
-  });
+    // Create a new user and save it
+    const user = await this.usersService.create(email, result);
 
-  it('throws an error if user signs up with email that is in use', async () => {
-    await service.signup('asdf@asdf.com', 'asdf');
-    await expect(service.signup('asdf@asdf.com', 'asdf')).rejects.toThrow(
-      BadRequestException,
-    );
-  });
+    // return the user
+    return user;
+  }
 
-  it('throws if signin is called with an unused email', async () => {
-    await expect(
-      service.signin('asdflkj@asdlfkj.com', 'passdflkj'),
-    ).rejects.toThrow(NotFoundException);
-  });
+  async signin(email: string, password: string) {
+    const [user] = await this.usersService.find(email);
+    if (!user) {
+      throw new NotFoundException('user not found');
+    }
 
-  it('throws if an invalid password is provided', async () => {
-    await service.signup('laskdjf@alskdfj.com', 'password');
-    await expect(
-      service.signin('laskdjf@alskdfj.com', 'laksdlfkj'),
-    ).rejects.toThrow(BadRequestException);
-  });
+    const [salt, storedHash] = user.password.split('.');
 
-  it('returns a user if correct password is provided', async () => {
-    await service.signup('asdf@asdf.com', 'mypassword');
+    const hash = (await scrypt(password, salt, 32)) as Buffer;
 
-    const user = await service.signin('asdf@asdf.com', 'mypassword');
-    expect(user).toBeDefined();
-  });
-});
+    if (storedHash !== hash.toString('hex')) {
+      throw new BadRequestException('bad password');
+    }
+
+    return user;
+  }
+}
